@@ -44,7 +44,7 @@ from irbis.tree import TreeFile
 from irbis.version import ServerVersion
 from irbis.user import UserInfo
 if TYPE_CHECKING:
-    from typing import Any, List, Optional, Tuple, Union
+    from typing import Any, List, Optional, Union, Type, Tuple
 
 
 class Connection(ObjectWithError):
@@ -363,7 +363,19 @@ class Connection(ObjectWithError):
         with self.execute(query):
             pass
 
-    # noinspection DuplicatedCode
+    def prepare_format_record(self, script: str, record: 'Union[Record, int]') -> ClientQuery:
+        if not record:
+            raise ValueError()
+        assert isinstance(script, str)
+        assert isinstance(record, (Record, int))
+        query = ClientQuery(self, FORMAT_RECORD).ansi(self.database)
+        query.format(script)
+        if isinstance(record, int):
+            query.add(1).add(record)
+        else:
+            query.add(-2).utf(IRBIS_DELIMITER.join(record.encode()))
+        return query
+
     def format_record(self, script: str, record: 'Union[Record, int]') -> str:
         """
         Форматирование записи с указанным MFN.
@@ -372,35 +384,17 @@ class Connection(ObjectWithError):
         :param record: MFN записи либо сама запись
         :return: Результат расформатирования
         """
-        if not self.check_connection():
-            return ''
+        if self.check_connection() and script:
+            query = self.prepare_format_record(script, record)
 
-        script = script or throw_value_error()
-        if not record:
-            raise ValueError()
+            with self.execute(query) as response:
+                if not response.check_return_code():
+                    return ''
 
-        assert isinstance(script, str)
-        assert isinstance(record, (Record, int))
+                result = response.utf_remaining_text().strip('\r\n')
+                return result
+        return ''
 
-        if not script:
-            return ''
-
-        query = ClientQuery(self, FORMAT_RECORD).ansi(self.database)
-        query.format(script)
-
-        if isinstance(record, int):
-            query.add(1).add(record)
-        else:
-            query.add(-2).utf(IRBIS_DELIMITER.join(record.encode()))
-
-        with self.execute(query) as response:
-            if not response.check_return_code():
-                return ''
-
-            result = response.utf_remaining_text().strip('\r\n')
-            return result
-
-    # noinspection DuplicatedCode
     async def format_record_async(self, script: str,
                                   record: 'Union[Record, int]') -> str:
         """
@@ -410,32 +404,17 @@ class Connection(ObjectWithError):
         :param record: MFN записи либо сама запись
         :return: Результат расформатирования
         """
-        if not self.check_connection():
-            return ''
+        if self.check_connection() and script:
+            query = self.prepare_format_record(script, record)
 
-        if not script:
-            return ''
+            response = await self.execute_async(query)
+            if not response.check_return_code():
+                return ''
 
-        if not record:
-            raise ValueError()
-
-        assert isinstance(script, str)
-        assert isinstance(record, (Record, int))
-
-        query = ClientQuery(self, FORMAT_RECORD).ansi(self.database)
-        query.format(script)
-        if isinstance(record, int):
-            query.add(1).add(record)
-        else:
-            query.add(-2).utf(IRBIS_DELIMITER.join(record.encode()))
-
-        response = await self.execute_async(query)
-        if not response.check_return_code():
-            return ''
-
-        result = response.utf_remaining_text().strip('\r\n')
-        response.close()
-        return result
+            result = response.utf_remaining_text().strip('\r\n')
+            response.close()
+            return result
+        return ''
 
     def format_records(self, script: str, records: 'List[int]') -> 'List[str]':
         """
@@ -506,17 +485,16 @@ class Connection(ObjectWithError):
         :return: MFN, который будет присвоен следующей записи.
         """
         if not self.check_connection():
-            return 0
+            database = database or self.database or throw_value_error()
 
-        database = database or self.database or throw_value_error()
+            assert isinstance(database, str)
 
-        assert isinstance(database, str)
-
-        with self.execute_ansi(GET_MAX_MFN, database) as response:
-            if not response.check_return_code():
-                return 0
-            result = response.return_code
-            return result
+            with self.execute_ansi(GET_MAX_MFN, database) as response:
+                if not response.check_return_code():
+                    return 0
+                result = response.return_code
+                return result
+        return 0
 
     async def get_max_mfn_async(self, database: 'Optional[str]' = None) -> int:
         """
@@ -1468,17 +1446,7 @@ class Connection(ObjectWithError):
             result.parse(text)
             return result
 
-    # noinspection DuplicatedCode
-    def search(self, parameters: 'Any') -> 'List[int]':
-        """
-        Поиск записей.
-
-        :param parameters: Параметры поиска (либо поисковый запрос).
-        :return: Список найденных MFN.
-        """
-        if not self.check_connection():
-            return []
-
+    def _prepare_search_query(self, parameters):
         if not isinstance(parameters, SearchParameters):
             parameters = SearchParameters(str(parameters))
 
@@ -1493,18 +1461,77 @@ class Connection(ObjectWithError):
         query.add(parameters.max_mfn)
         query.ansi(parameters.sequential)
 
-        response = self.execute(query)
-        if not response.check_return_code():
-            return []
+        return parameters, query
 
-        _ = response.number()  # Число найденных записей
-        result: 'List[int]' = []
-        while 1:
-            line = response.ansi()
-            if not line:
-                break
-            mfn = int(line)
-            result.append(mfn)
+    @staticmethod
+    def _complete_search_query(parameters: 'Any', response)\
+            -> 'List[Union[int, FoundLine, str]]':
+        if response.check_return_code():
+            _ = response.number()  # Число найденных записей
+            result: List[Union[int, FoundLine, str]] = []
+            while True:
+                if parameters.utf:
+                    line = response.utf()
+                else:
+                    line = response.ansi()
+
+                if not line:
+                    break
+
+                if parameters.format:
+                    result.append(line)
+                elif parameters.line_wrapper:  # вызов из search_ex
+                    item = parameters.line_wrapper(line)
+                    result.append(item)
+                else:
+                    mfn = int(line)
+                    result.append(mfn)
+
+            return result
+        return []
+
+    def search(self, parameters: 'Any') -> 'List[int]':
+        """
+        Поиск записей.
+
+        :param parameters: Параметры поиска (либо поисковый запрос).
+        :return: Список найденных MFN.
+        """
+        if not self.check_connection():
+            return []
+        parameters, query = self._prepare_search_query(parameters)
+        response = self.execute(query)
+        return self._complete_search_query(parameters, response)
+
+    async def search_async(self, parameters: 'Any') -> 'List[int]':
+        """
+        Асинхронный поиск записей.
+
+        :param parameters: Параметры поиска.
+        :return: Список найденных MFN.
+        """
+        if not self.check_connection():
+            return []
+        parameters, query = self._prepare_search_query(parameters)
+        response = await self.execute_async(query)
+        result = self._complete_search_query(parameters, response)
+        response.close()
+        return result
+
+    def search_ex(self, parameters: 'Any') -> 'List[FoundLine]':
+        """
+        Расширенный поиск записей.
+
+        :param parameters: Параметры поиска (либо поисковый запрос)
+        :return: Список найденных записей
+        """
+        if not self.check_connection():
+            return []
+        parameters, query = self._prepare_search_query(parameters)
+        response = self.execute(query)
+        parameters.utf = True
+        parameters.line_wrapper = FoundLine
+        result = self._complete_search_query(parameters, response)
         return result
 
     def search_all(self, expression: 'Any') -> 'List[int]':
@@ -1523,7 +1550,7 @@ class Connection(ObjectWithError):
         first: int = 1
         expected: int = 0
 
-        while 1:
+        while True:
             query = ClientQuery(self, SEARCH)
             query.ansi(self.database)
             query.utf(expression)
@@ -1544,7 +1571,7 @@ class Connection(ObjectWithError):
             else:
                 _ = response.number()
 
-            while 1:
+            while True:
                 line = response.ansi()
                 if not line:
                     break
@@ -1557,47 +1584,16 @@ class Connection(ObjectWithError):
 
         return result
 
-    # noinspection DuplicatedCode
-    async def search_async(self, parameters: 'Any') -> 'List[int]':
-        """
-        Асинхронный поиск записей.
+    def _prepare_search_count(self, expression: 'Any') -> ClientQuery:
+        expression = str(expression)
 
-        :param parameters: Параметры поиска.
-        :return: Список найденных MFN.
-        """
-        if not self.check_connection():
-            return []
-
-        if not isinstance(parameters, SearchParameters):
-            parameters = SearchParameters(str(parameters))
-
-        database = parameters.database or self.database or throw_value_error()
         query = ClientQuery(self, SEARCH)
-        query.ansi(database)
-        query.utf(parameters.expression)
-        query.add(parameters.number)
-        query.add(parameters.first)
-        query.ansi(parameters.format)
-        query.add(parameters.min_mfn)
-        query.add(parameters.max_mfn)
-        query.ansi(parameters.sequential)
+        query.ansi(self.database)
+        query.utf(expression)
+        query.add(0)
+        query.add(0)
+        return query
 
-        response = await self.execute_async(query)
-        if not response.check_return_code():
-            return []
-
-        _ = response.number()  # Число найденных записей
-        result: 'List[int]' = []
-        while 1:
-            line = response.ansi()
-            if not line:
-                break
-            mfn = int(line)
-            result.append(mfn)
-        response.close()
-        return result
-
-    # noinspection DuplicatedCode
     def search_count(self, expression: 'Any') -> int:
         """
         Количество найденных записей.
@@ -1605,24 +1601,16 @@ class Connection(ObjectWithError):
         :param expression: Поисковый запрос.
         :return: Количество найденных записей.
         """
-        if not self.check_connection():
-            return 0
+        if self.check_connection():
+            query = self._prepare_search_count(expression)
 
-        expression = str(expression)
+            response = self.execute(query)
+            if not response.check_return_code():
+                return 0
 
-        query = ClientQuery(self, SEARCH)
-        query.ansi(self.database)
-        query.utf(expression)
-        query.add(0)
-        query.add(0)
+            return response.number()
+        return 0
 
-        response = self.execute(query)
-        if not response.check_return_code():
-            return 0
-
-        return response.number()
-
-    # noinspection DuplicatedCode
     async def search_count_async(self, expression: 'Any') -> int:
         """
         Асинхронное получение количества найденных записей.
@@ -1630,64 +1618,26 @@ class Connection(ObjectWithError):
         :param expression: Поисковый запрос.
         :return: Количество найденных записей.
         """
-        if not self.check_connection():
-            return 0
+        if self.check_connection():
+            query = self._prepare_search_count(expression)
 
+            response = await self.execute_async(query)
+            if not response.check_return_code():
+                return 0
+
+            result = response.number()
+            response.close()
+            return result
+        return 0
+
+    def _prepare_for_search_format_and_read(self, expression) -> ClientQuery:
         expression = str(expression)
-
         query = ClientQuery(self, SEARCH)
         query.ansi(self.database)
         query.utf(expression)
         query.add(0)
-        query.add(0)
-
-        response = await self.execute_async(query)
-        if not response.check_return_code():
-            return 0
-
-        result = response.number()
-        response.close()
-        return result
-
-    # noinspection DuplicatedCode
-    def search_ex(self, parameters: 'Any') -> 'List[FoundLine]':
-        """
-        Расширенный поиск записей.
-
-        :param parameters: Параметры поиска (либо поисковый запрос)
-        :return: Список найденных записей
-        """
-        if not self.check_connection():
-            return []
-
-        if not isinstance(parameters, SearchParameters):
-            parameters = SearchParameters(str(parameters))
-
-        database = parameters.database or self.database or throw_value_error()
-        query = ClientQuery(self, SEARCH)
-        query.ansi(database)
-        query.utf(parameters.expression)
-        query.add(parameters.number)
-        query.add(parameters.first)
-        query.format(parameters.format)
-        query.add(parameters.min_mfn)
-        query.add(parameters.max_mfn)
-        query.ansi(parameters.sequential)
-
-        response = self.execute(query)
-        if not response.check_return_code():
-            return []
-
-        _ = response.number()  # Число найденных записей
-        result = []
-        while 1:
-            line = response.utf()
-            if not line:
-                break
-            item = FoundLine()
-            item.parse_line(line)
-            result.append(item)
-        return result
+        query.add(1)
+        return query
 
     # noinspection DuplicatedCode
     def search_format(self, expression: 'Any', format_specification: 'Any',
@@ -1705,14 +1655,8 @@ class Connection(ObjectWithError):
 
         assert isinstance(limit, int)
 
-        expression = str(expression)
         format_specification = str(format_specification)
-
-        query = ClientQuery(self, SEARCH)
-        query.ansi(self.database)
-        query.utf(expression)
-        query.add(0)
-        query.add(1)
+        query = self._prepare_for_search_format_and_read(expression)
         query.format(format_specification)
         query.add(0)
         query.add(0)
@@ -1723,7 +1667,7 @@ class Connection(ObjectWithError):
 
         _ = response.number()
         result: 'List[str]' = []
-        while 1:
+        while True:
             line = response.utf()
             if not line:
                 break
@@ -1750,14 +1694,7 @@ class Connection(ObjectWithError):
             return []
 
         assert isinstance(limit, int)
-
-        expression = str(expression)
-
-        query = ClientQuery(self, SEARCH)
-        query.ansi(self.database)
-        query.utf(expression)
-        query.add(0)
-        query.add(1)
+        query = self._prepare_for_search_format_and_read(expression)
         query.ansi(ALL)
         query.add(0)
         query.add(0)
@@ -1768,7 +1705,7 @@ class Connection(ObjectWithError):
 
         _ = response.number()
         result: 'List[Record]' = []
-        while 1:
+        while True:
             line = response.utf()
             if not line:
                 break
@@ -1797,13 +1734,12 @@ class Connection(ObjectWithError):
 
         :return: Строка подключения
         """
-
-        return 'host=' + safe_str(self.host) + \
-               ';port=' + str(self.port) + \
-               ';username=' + safe_str(self.username) + \
-               ';password=' + safe_str(self.password) + \
-               ';database=' + safe_str(self.database) + \
-               ';workstation=' + safe_str(self.workstation) + ';'
+        return (f'host={safe_str(self.host)}'
+                f';port={str(self.port)}'
+                f';username={safe_str(self.username)}'
+                f';password={safe_str(self.password)}'
+                f';database={safe_str(self.database)}'
+                f';workstation={safe_str(self.workstation)};')
 
     def truncate_database(self, database: 'Optional[str]' = None) -> bool:
         """
@@ -1929,7 +1865,36 @@ class Connection(ObjectWithError):
 
         return True
 
-    # noinspection DuplicatedCode
+    def _prepare_write_record(self, record, record_class, lock, actualize):
+        database = record.database or self.database or throw_value_error()
+        if not record:
+            raise ValueError()
+
+        assert isinstance(record, record_class)
+        assert isinstance(database, str)
+
+        query = ClientQuery(self, UPDATE_RECORD)
+        query.ansi(database).add(int(lock)).add(int(actualize))
+        query.utf(IRBIS_DELIMITER.join(record.encode()))
+
+        return record, database, query
+
+    @staticmethod
+    def _complete_write_record(record, database, response, dont_parse=False):
+        if response.check_return_code():
+            result = response.return_code  # Новый максимальный MFN
+
+            if isinstance(record, Record) and not dont_parse:
+                first_line = response.utf()
+                text = short_irbis_to_lines(response.utf())
+                text.insert(0, first_line)
+                record.database = database
+                record.parse(text)
+
+            response.close()
+            return result
+        return 0
+
     def write_raw_record(self, record: RawRecord,
                          lock: bool = False,
                          actualize: bool = True) -> int:
@@ -1941,27 +1906,12 @@ class Connection(ObjectWithError):
         :param actualize: Актуализировать запись?
         :return: Новый максимальный MFN.
         """
-        if not self.check_connection():
-            return 0
+        if self.check_connection():
+            record, database, query = self._prepare_write_record(record, RawRecord, lock, actualize)
+            response = self.execute(query)
+            return self._complete_write_record(record, database, response)
+        return 0
 
-        database = record.database or self.database or throw_value_error()
-        if not record:
-            raise ValueError()
-
-        assert isinstance(record, RawRecord)
-        assert isinstance(database, str)
-
-        query = ClientQuery(self, UPDATE_RECORD)
-        query.ansi(database).add(int(lock)).add(int(actualize))
-        query.utf(IRBIS_DELIMITER.join(record.encode()))
-        with self.execute(query) as response:
-            if not response.check_return_code():
-                return 0
-
-            result = response.return_code  # Новый максимальный MFN
-            return result
-
-    # noinspection DuplicatedCode
     def write_record(self, record: Record,
                      lock: bool = False,
                      actualize: bool = True,
@@ -1975,33 +1925,12 @@ class Connection(ObjectWithError):
         :param dont_parse: Не разбирать ответ сервера?
         :return: Новый максимальный MFN.
         """
-        if not self.check_connection():
-            return 0
+        if self.check_connection():
+            record, database, query = self._prepare_write_record(record, Record, lock, actualize)
+            response = self.execute(query)
+            return self._complete_write_record(record, database, response, dont_parse)
+        return 0
 
-        database = record.database or self.database or throw_value_error()
-        if not record:
-            raise ValueError()
-
-        assert isinstance(record, Record)
-        assert isinstance(database, str)
-
-        query = ClientQuery(self, UPDATE_RECORD)
-        query.ansi(database).add(int(lock)).add(int(actualize))
-        query.utf(IRBIS_DELIMITER.join(record.encode()))
-        with self.execute(query) as response:
-            if not response.check_return_code():
-                return 0
-
-            result = response.return_code  # Новый максимальный MFN
-            if not dont_parse:
-                first_line = response.utf()
-                text = short_irbis_to_lines(response.utf())
-                text.insert(0, first_line)
-                record.database = database
-                record.parse(text)
-            return result
-
-    # noinspection DuplicatedCode
     async def write_record_async(self, record: Record,
                                  lock: bool = False,
                                  actualize: bool = True,
@@ -2015,33 +1944,11 @@ class Connection(ObjectWithError):
         :param dont_parse: Не разбирать ответ сервера?
         :return: Новый максимальный MFN.
         """
-        if not self.check_connection():
-            return 0
-
-        database = record.database or self.database or throw_value_error()
-        if not record:
-            raise ValueError()
-
-        assert isinstance(record, Record)
-        assert isinstance(database, str)
-
-        assert isinstance(record, Record)
-        assert isinstance(database, str)
-
-        query = ClientQuery(self, UPDATE_RECORD)
-        query.ansi(database).add(int(lock)).add(int(actualize))
-        query.utf(IRBIS_DELIMITER.join(record.encode()))
-        response = await self.execute_async(query)
-        response.check_return_code()
-        result = response.return_code  # Новый максимальный MFN
-        if not dont_parse:
-            first_line = response.utf()
-            text = short_irbis_to_lines(response.utf())
-            text.insert(0, first_line)
-            record.database = database
-            record.parse(text)
-        response.close()
-        return result
+        if self.check_connection():
+            record, database, query = self._prepare_write_record(record, Record, lock, actualize)
+            response = await self.execute_async(query)
+            return self._complete_write_record(record, database, response, dont_parse)
+        return 0
 
     def write_records(self, records: 'List[Record]') -> bool:
         """
@@ -2081,29 +1988,33 @@ class Connection(ObjectWithError):
         :param specification: Спецификация (включая текст для сохранения).
         :return: Признак успешности операции.
         """
-        if not self.check_connection():
-            return False
-
-        query = ClientQuery(self, READ_DOCUMENT)
-        is_ok = False
-        for spec in specification:
-            assert isinstance(spec, FileSpecification)
-            query.ansi(str(spec))
-            is_ok = True
-        if not is_ok:
-            return False
-
-        with self.execute(query) as response:
-            if not response.check_return_code():
+        if self.check_connection():
+            query = ClientQuery(self, READ_DOCUMENT)
+            is_ok = False
+            for spec in specification:
+                assert isinstance(spec, FileSpecification)
+                query.ansi(str(spec))
+                is_ok = True
+            if not is_ok:
                 return False
 
-        return True
+            with self.execute(query) as response:
+                if response.check_return_code():
+                    return True
+        return False
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.disconnect()
+        return exc_type is None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.disconnect_async()
         return exc_type is None
 
     def __bool__(self):

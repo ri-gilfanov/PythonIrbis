@@ -18,9 +18,11 @@ class FoundLine:
 
     __slots__ = ('mfn', 'description')
 
-    def __init__(self) -> None:
+    def __init__(self, line: str = None) -> None:
         self.mfn: int = 0
         self.description: 'Optional[str]' = None
+        if line:
+            self.parse_line(line)
 
     def parse_line(self, line: str) -> None:
         """
@@ -44,7 +46,8 @@ class SearchParameters:
     """
 
     __slots__ = ('database', 'first', 'format', 'max_mfn', 'min_mfn',
-                 'number', 'expression', 'sequential', 'filter', 'utf')
+                 'number', 'expression', 'sequential', 'filter', 'utf',
+                 'line_wrapper')
 
     def __init__(self, expression: 'Optional[str]' = None,
                  number: int = 0) -> None:
@@ -58,6 +61,7 @@ class SearchParameters:
         self.sequential: 'Optional[str]' = None
         self.filter: 'Optional[str]' = None
         self.utf = False
+        self.line_wrapper = None
 
     def __str__(self):
         return self.expression
