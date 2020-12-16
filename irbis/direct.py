@@ -8,7 +8,7 @@ from io import SEEK_SET
 from ctypes import BigEndianStructure, c_int32, c_uint16, c_uint32
 from typing import TYPE_CHECKING
 from irbis._common import change_extension, UTF
-from irbis.records import Field, RawRecord, Record
+from irbis.records import Field, Record
 if TYPE_CHECKING:
     from typing import List
 
@@ -178,19 +178,12 @@ class MstRecord:
         self.leader: MstLeader = MstLeader()
         self.fields: 'List[MstField]' = []
 
-    def decode_raw(self) -> RawRecord:
+    def decode_raw(self) -> Record:
         """
-        Декодирование в сырую запись.
+        Устаревший метод
         :return:
         """
-        result = RawRecord()
-        result.mfn = self.leader.mfn
-        result.version = self.leader.version
-        result.status = self.leader.status
-        for field in self.fields:
-            line = f"{field.tag}#{field.value}"
-            result.fields.append(line)
-        return result
+        return self.decode_record()
 
     def decode_record(self) -> Record:
         """
@@ -489,14 +482,13 @@ class DirectAccess:
         result = self._mst.read_record(xrf_record.offset())
         return result
 
-    def read_raw_record(self, mfn: int) -> RawRecord:
+    def read_raw_record(self, mfn: int) -> Record:
         """
-        Чтение RAW-записи.
+        Устаревший метод.
         :param mfn: MFN.
         :return: Прочитанная запись.
         """
-        mst_record = self.read_mst_record(mfn)
-        return mst_record.decode_raw()
+        return self.read_record(mfn)
 
     def read_record(self, mfn: int) -> Record:
         """

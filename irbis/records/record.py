@@ -7,11 +7,12 @@
 from collections import OrderedDict
 from typing import cast, TYPE_CHECKING
 from irbis.abstract import DictLike, Hashable
+from irbis._common import LOGICALLY_DELETED, PHYSICALLY_DELETED
 from irbis.records.abstract import AbstractRecord
 from irbis.records.field import Field
 from irbis.records.subfield import SubField
 if TYPE_CHECKING:
-    from typing import Dict, List, Optional, Set, Union, Type
+    from typing import Any, Dict, List, Optional, Set, Union, Type
     from irbis.records.field import FieldList, FieldSetValue, SubFieldDicts
 
     RecordArg = Union[Field, Dict[int, SubFieldDicts]]
@@ -28,7 +29,12 @@ class Record(AbstractRecord, DictLike, Hashable):
 
     def __init__(self, *args: 'RecordArg') -> None:
         self.field_type: 'Type[Field]' = Field
-        super().__init__(*args)
+        self.database: 'Optional[str]' = None
+        self.mfn = 0
+        self.version = 0
+        self.status = 0
+        self.fields: 'Any' = []
+        self.__bulk_set__(*args)
 
     def __bulk_set__(self, *args: 'RecordArg'):
         """
@@ -112,8 +118,28 @@ class Record(AbstractRecord, DictLike, Hashable):
 
         return [f.to_dict() for f in self.fields if f.tag == tag]
 
-    def clone_fields(self) -> 'FieldList':
-        return [field.clone() for field in self.fields]
+    def clear(self) -> 'AbstractRecord':
+        """
+        Очистка записи (удаление всех полей).
+
+        :return: Self
+        """
+        self.fields.clear()
+        return self
+
+    def clone(self) -> 'AbstractRecord':
+        """
+        Клонирование записи.
+
+        :return: Полный клон записи
+        """
+        result = self.__class__()
+        result.database = self.database
+        result.mfn = self.mfn
+        result.status = self.status
+        result.version = self.version
+        result.fields = [field.clone() for field in self.fields]
+        return result
 
     @property
     def data(self) -> 'Dict[int, List[OrderedDict]]':
@@ -200,6 +226,18 @@ class Record(AbstractRecord, DictLike, Hashable):
                 return field.to_dict()
         return OrderedDict()
 
+    def encode(self) -> 'List[str]':
+        """
+        Кодирование записи в серверное представление.
+
+        :return: Список строк
+        """
+        result = [str(self.mfn) + '#' + str(self.status),
+                  '0#' + str(self.version)]
+        for field in self.fields:
+            result.append(str(field))
+        return result
+
     def have_field(self, tag: int) -> bool:
         """
         Есть ли в записи поле с указанной меткой?
@@ -230,6 +268,13 @@ class Record(AbstractRecord, DictLike, Hashable):
         self.fields.insert(index, result)
         return result
 
+    def is_deleted(self) -> bool:
+        """
+        Удалена ли запись?
+        :return: True для удаленной записи
+        """
+        return (self.status & (LOGICALLY_DELETED | PHYSICALLY_DELETED)) != 0
+
     def keys(self) -> 'List[int]':
         """
         Получение списка меток полей без повторений и с сохранением порядка
@@ -241,10 +286,30 @@ class Record(AbstractRecord, DictLike, Hashable):
         return [f.tag for f in self.fields
                 if not (f.tag in unique or add(f.tag))]
 
-    def parse_line(self, line: str) -> None:
-        field = self.field_type()
-        field.parse(line)
-        self.fields.append(field)
+    def parse(self, text: 'List[str]') -> None:
+        """
+        Разбор текстового представления записи (в серверном формате).
+
+        :param text: Список строк
+        :return: None
+        """
+        if text:
+            line = text[0]
+            parts = line.split('#')
+            self.mfn = int(parts[0])
+            if len(parts) != 1 and parts[1]:
+                self.status = int(parts[1])
+            line = text[1]
+            parts = line.split('#')
+            self.version = int(parts[1])
+            self.fields.clear()
+            for line in text[2:]:
+                if line:
+                    field = self.field_type()
+                    field.parse(line)
+                    self.fields.append(field)
+        else:
+            raise ValueError('text argument is empty')
 
     def remove_field(self, tag: int) -> 'Record':
         """
@@ -254,6 +319,18 @@ class Record(AbstractRecord, DictLike, Hashable):
         :return: Self.
         """
         self.__delitem__(tag)
+        return self
+
+    def reset(self) -> 'Record':
+        """
+        Сбрасывает состояние записи, отвязывая её от базы данных.
+        Поля при этом остаются нетронутыми.
+        :return: Self.
+        """
+        self.mfn = 0
+        self.status = 0
+        self.version = 0
+        self.database = None
         return self
 
     def set_field(self, tag: int, value: 'Optional[str]') -> 'Record':
@@ -380,3 +457,13 @@ class Record(AbstractRecord, DictLike, Hashable):
     def __hash__(self):
         fields_hashes = tuple(hash(f) for f in self.fields)
         return hash(fields_hashes)
+
+    def __bool__(self):
+        return bool(len(self.fields))
+
+    def __len__(self):
+        return len(self.fields)
+
+    def __str__(self):
+        result = [str(field) for field in self.fields]
+        return '\n'.join(result)
